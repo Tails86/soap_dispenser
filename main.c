@@ -2,11 +2,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+inline void nextMode(int8_t mode);
 inline void outputIrStop();
-inline void setupLpm3Interrupt(uint16_t counterMax, int8_t mode);
 inline bool isBattLow();
 inline void timerModeWait();
 inline void timerModeIrCheck();
+inline void prankDispense();
 inline void timerModeDispense();
 
 // Pin definitions
@@ -43,9 +44,8 @@ inline void timerModeDispense();
 // Enable or disable oscillator on exit of interrupt (the difference between LPM3 and LPM4)
 #define ENABLE_OSCILLATOR_ON_EXIT() __bic_SR_register_on_exit(OSCOFF)
 #define DISABLE_OSCILLATOR_ON_EXIT() __bis_SR_register_on_exit(OSCOFF)
-// To be called within context of an ISR (float math only done by precompiler)
-#define NEXT_MODE_MS(ms, mode) setupLpm3Interrupt((ms / 1000.0) * ACLK_FREQ - 1, mode)
-#define NEXT_MODE_COUNTS(counts, mode) setupLpm3Interrupt(counts, mode)
+// Converts milliseconds to clock counts for CCR0 (float math only done by precompiler)
+#define MS_TO_COUNTS(ms) ((ms / 1000.0) * ACLK_FREQ - 1)
 
 // Length of time to turn on the ON LED and OFF LED
 #define ON_LED_TIME_MS 1000
@@ -87,13 +87,24 @@ inline void timerModeDispense();
 #define CHECK_BATT_PERIOD_S 10
 #define CHECK_BATT_COUNT (int16_t)(CHECK_BATT_PERIOD_S * 1000 / (IR_WAIT_PERIOD_MS + MAX_IR_SENSE_TIME_MS))
 
+// Defines how many consecutive power ons are necessary to enable prank mode
+#define PRANK_MODE_POWER_ON_COUNT 3
+
 // State machine modes
-#define TIMER_MODE_NONE         0
-#define TIMER_MODE_IR_WAIT      1
-#define TIMER_MODE_IR_CHECK     2
-#define TIMER_MODE_DISPENSE     3
-#define TIMER_MODE_ENTER_RUN    4
-#define TIMER_MODE_EXIT_RUN     5
+#define TIMER_MODE_IR_WAIT      0
+#define TIMER_MODE_IR_CHECK     1
+#define TIMER_MODE_DISPENSE     2
+#define TIMER_MODE_ENTER_RUN    3
+#define TIMER_MODE_EXIT_RUN     4
+#define TIMER_MODE_NONE         5
+// The max timer counter for each of the above modes
+int16_t gModeCounterLookup[5] = {
+    MS_TO_COUNTS(IR_WAIT_PERIOD_MS),
+    IR_CHECK_COUNTER,
+    IR_CHECK_COUNTER,
+    MS_TO_COUNTS(ON_LED_TIME_MS),
+    MS_TO_COUNTS(OFF_LED_TIME_MS)
+};
 
 // Current state machine mode
 int8_t gTimerMode = TIMER_MODE_NONE;
@@ -112,6 +123,10 @@ int16_t gDispenseTime = 0;
 int16_t gBattWaitCount = 0;
 // Counter used to keep track of how long we have been waiting
 int16_t gSensorUnblockCount = 0;
+// Counts the number of consecutive power on cycles
+int16_t gPowerOnCount = 0;
+// Prank mode enabled once the above reaches PRANK_MODE_POWER_ON_COUNT
+bool gPrankModeEnabled = false;
 /**
  * main.c
  */
@@ -147,11 +162,11 @@ int main(void)
     return 0;
 }
 
-inline void setupLpm3Interrupt(uint16_t counterMax, int8_t mode)
+inline void nextMode(int8_t mode)
 {
     CCTL0 = 0; // Make sure interrupt is disabled
     gTimerMode = mode;
-    CCR0 = counterMax;
+    CCR0 = gModeCounterLookup[mode];
     TA0CTL |= TACLR; // Reset counter
     CCTL0 = CCIE; // Enable interrupt
 }
@@ -201,7 +216,7 @@ inline void timerModeWait()
     P1IE |= P1_IPIN_IR_SENSE;
     // Waiting a moment to go into check mode (instead of just dropping right into it)
     // This will allow the IR active line to go high before first entry
-    NEXT_MODE_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_IR_CHECK);
+    nextMode(TIMER_MODE_IR_CHECK);
 }
 
 inline void timerModeIrCheck()
@@ -223,7 +238,15 @@ inline void timerModeIrCheck()
                 gDispenseTime = 0;
                 SET_IR_ACTIVE(false);
                 SET_PUMP(true);
-                NEXT_MODE_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_DISPENSE);
+                if (gPrankModeEnabled)
+                {
+                    // Do prank mode dispense right in line (no way to power off)
+                    prankDispense();
+                }
+                else
+                {
+                    nextMode(TIMER_MODE_DISPENSE);
+                }
             }
         }
         else if (gIrCount >= IR_SENSE_PULSES || gSenseCount + IR_SENSE_PULSES - gIrCount < IR_ACTIVATION_THRESHOLD)
@@ -231,10 +254,38 @@ inline void timerModeIrCheck()
             // All pulses were made without sensing hand or there is no way to reach the threshold with subsequent pulses
             // Stop and go to wait state
             outputIrStop();
-            NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+            nextMode(TIMER_MODE_IR_WAIT);
         }
     }
     TOGGLE_IR_PULSE();
+}
+
+inline void prankDispense()
+{
+    SET_PUMP(true);
+    SET_WHITE_LED(true);
+    __delay_cycles(1000000);
+    SET_PUMP(false);
+    SET_WHITE_LED(false);
+    __delay_cycles(3000000);
+    SET_PUMP(true);
+    SET_WHITE_LED(true);
+    __delay_cycles(10000);
+    SET_PUMP(false);
+    __delay_cycles(50000);
+    SET_PUMP(true);
+    __delay_cycles(50000);
+    SET_WHITE_LED(true);
+    __delay_cycles(30000);
+    SET_WHITE_LED(false);
+    __delay_cycles(30000);
+    SET_WHITE_LED(true);
+    SET_PUMP(false);
+    __delay_cycles(3000000);
+    SET_PUMP(true);
+    __delay_cycles(3000000);
+    SET_PUMP(false);
+    SET_WHITE_LED(false);
 }
 
 inline void timerModeDispense()
@@ -283,7 +334,7 @@ inline void timerModeDispense()
         {
             // We are done dispensing
             ALL_OUTPUTS_OFF();
-            NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+            nextMode(TIMER_MODE_IR_WAIT);
             // Force battery check on IR wait entry
             gBattWaitCount = CHECK_BATT_COUNT;
         }
@@ -318,7 +369,7 @@ inline void timerModeDispense()
 #pragma vector = TIMER0_A0_VECTOR
 __interrupt void Timer_A0(void)
 {
-    switch(gTimerMode)
+    switch (gTimerMode)
     {
     case TIMER_MODE_IR_WAIT:
         timerModeWait();
@@ -332,7 +383,13 @@ __interrupt void Timer_A0(void)
     case TIMER_MODE_ENTER_RUN:
         // Enter run mode
         ALL_OUTPUTS_OFF();
-        NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+        nextMode(TIMER_MODE_IR_WAIT);
+        if (gPrankModeEnabled)
+        {
+            SET_RED_LED(true);
+            __delay_cycles(100000);
+            SET_RED_LED(false);
+        }
         break;
     case TIMER_MODE_EXIT_RUN: // Fall through
     case TIMER_MODE_NONE: // Fall through
@@ -361,16 +418,26 @@ __interrupt void Port_1(void)
       if (gPowerState)
       {
           // Go from on to off
+          if (gTimerMode != TIMER_MODE_ENTER_RUN)
+          {
+              gPowerOnCount = 0;
+          }
+          gPrankModeEnabled = false;
           ALL_OUTPUTS_OFF();
           SET_RED_LED(true);
-          NEXT_MODE_MS(OFF_LED_TIME_MS, TIMER_MODE_EXIT_RUN);
+          nextMode(TIMER_MODE_EXIT_RUN);
       }
       else
       {
           // Go from off to on
+          if (gTimerMode == TIMER_MODE_EXIT_RUN)
+          {
+              gPowerOnCount++;
+              gPrankModeEnabled = (gPowerOnCount == PRANK_MODE_POWER_ON_COUNT);
+          }
           ALL_OUTPUTS_OFF();
           SET_WHITE_LED(true);
-          NEXT_MODE_MS(ON_LED_TIME_MS, TIMER_MODE_ENTER_RUN);
+          nextMode(TIMER_MODE_ENTER_RUN);
           ENABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM4 to LPM3
       }
       // Toggle to new state
