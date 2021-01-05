@@ -5,6 +5,9 @@
 inline void outputIrStop();
 inline void setupLpm3Interrupt(uint16_t counterMax, int8_t mode);
 inline bool isBattLow();
+inline void timerModeWait();
+inline void timerModeIrCheck();
+inline void timerModeDispense();
 
 // Pin definitions
 #define P1_OPIN_IR_ACTIVE 0x02
@@ -25,23 +28,24 @@ inline bool isBattLow();
 
 // Setter macros
 #define SET_OUTPUT(port, mask, on) (on ? (port |= mask) : (port &= ~mask))
+#define TOGGLE_OUTPUT(port, mask) (port ^= mask)
 #define SET_WHITE_LED(on) SET_OUTPUT(P1OUT, P1_OPIN_WHITE_LED, on)
 #define SET_RED_LED(on) SET_OUTPUT(P1OUT, P1_OPIN_RED_LED, on)
 #define SET_IR_ACTIVE(on) SET_OUTPUT(P1OUT, P1_OPIN_IR_ACTIVE, on)
 #define SET_PUMP(on) SET_OUTPUT(P1OUT, P1_OPIN_PUMP, on)
 #define SET_IR_PULSE(on) SET_OUTPUT(P1OUT, P1_OPIN_IR_PULSE, on)
+#define TOGGLE_IR_PULSE() TOGGLE_OUTPUT(P1OUT, P1_OPIN_IR_PULSE)
 // All control IO are on port 1
 #define ALL_OUTPUTS_OFF() P1OUT &= ~ALL_P1_OUTPUTS_MASK
 
 // External crystal frequency
 #define ACLK_FREQ 32768
-// Go to LPM3 on exit of interrupt
-#define LPM3_ON_EXIT() __bis_SR_register_on_exit(LPM3_bits)
-// Go to LPM4 on exit of interrupt
-#define LPM4_ON_EXIT() __bis_SR_register_on_exit(LPM4_bits)
+// Enable or disable oscillator on exit of interrupt (the difference between LPM3 and LPM4)
+#define ENABLE_OSCILLATOR_ON_EXIT() __bic_SR_register_on_exit(OSCOFF)
+#define DISABLE_OSCILLATOR_ON_EXIT() __bis_SR_register_on_exit(OSCOFF)
 // To be called within context of an ISR (float math only done by precompiler)
-#define NEXT_MODE_ON_EXIT_MS(ms, mode) setupLpm3Interrupt((ms / 1000.0) * ACLK_FREQ - 1, mode); LPM3_ON_EXIT()
-#define NEXT_MODE_ON_EXIT_COUNTS(counts, mode) setupLpm3Interrupt(counts, mode); LPM3_ON_EXIT()
+#define NEXT_MODE_MS(ms, mode) setupLpm3Interrupt((ms / 1000.0) * ACLK_FREQ - 1, mode)
+#define NEXT_MODE_COUNTS(counts, mode) setupLpm3Interrupt(counts, mode)
 
 // Length of time to turn on the ON LED and OFF LED
 #define ON_LED_TIME_MS 1000
@@ -53,7 +57,6 @@ inline bool isBattLow();
 
 // Definitions of how many pulses we make for each IR check
 #define IR_SENSE_PULSES 5
-#define IR_SENSE_TRANSITIONS (IR_SENSE_PULSES * 2)
 // Number of pulses within IR_SENSE_PULSES that must have sense before activation
 #define IR_ACTIVATION_THRESHOLD 3
 #define MAX_IR_SENSE_TIME_MS (IR_SENSE_PULSES * 1000 / IR_FREQUNCY)
@@ -63,8 +66,8 @@ inline bool isBattLow();
 
 // Definitions for dispense
 // The number of CONSECUTIVE pulses while dispensing must not have sense before deactivation
-#define IR_DEACTIVATION_THRESHOLD 20
-#define MIN_DISPENSE_TIME_S 0.9
+#define IR_DEACTIVATION_THRESHOLD 200
+#define MIN_DISPENSE_TIME_S 0.1
 #define MAX_DISPENSE_TIME_S 1.8
 // Need to multiply this by 2 because the counts are incremented on each state transition
 #define MIN_DISPENSE_COUNT (int16_t)(MIN_DISPENSE_TIME_S * IR_FREQUNCY * 2)
@@ -100,7 +103,7 @@ bool gPowerState = false;
 // Current IR state count
 int8_t gIrCount = 0;
 // Number of pulses where hand is sensed
-int8_t gSenseCount = 0;
+int16_t gSenseCount = 0;
 // Set by hand sense input interrupt
 bool gHandSensed = false;
 // Current dispense time counter (used in TIMER_MODE_DISPENSE)
@@ -131,15 +134,11 @@ int main(void)
     P1IE = P1_IPIN_BUTTON;
     P1IES = P1_IPIN_IR_SENSE;
 
-    // Finally, enable interrupts and enter LPM4 (initialized as powered off)
-    __enable_interrupt();
     while(1)
     {
-        // We should only reach here 0 or 1 times
-        // This whole program is interrupt driven, so the chip should be in LPM3 or LPM4,
-        // waiting from the next interrupt. LPM3 keeps the timer active while LPM4 turns that off.
-        // This means that the timer interrupt will only be active in LPM3.
-        LPM4;
+        // Finally, enter LPM4 and enable interrupts
+        // (initialized as powered off, waiting for first button press)
+        __bis_SR_register(LPM4_bits + GIE);
         // Should not reach here, but just in case...
         ALL_OUTPUTS_OFF();
     }
@@ -177,79 +176,82 @@ inline bool isBattLow()
     return battDetect;
 }
 
-//Timer ISR
-#pragma vector = TIMER0_A0_VECTOR
-__interrupt void Timer_A0(void)
+inline void timerModeWait()
 {
-    switch(gTimerMode)
+    ALL_OUTPUTS_OFF();
+    ++gBattWaitCount;
+    if (gBattWaitCount >= CHECK_BATT_COUNT)
     {
-    case TIMER_MODE_IR_WAIT:
-        ALL_OUTPUTS_OFF();
-        ++gBattWaitCount;
-        if (gBattWaitCount >= CHECK_BATT_COUNT)
+        gBattWaitCount = 0;
+        if (isBattLow())
         {
-            gBattWaitCount = 0;
-            if (isBattLow())
+            // Turn on red LED which should be shut off in one of:
+            // - Next TIMER_MODE_IR_WAIT entry on call to ALL_OUTPUTS_OFF()
+            // - In TIMER_MODE_IR_CHECK when dispense entered
+            // - When device is powered off
+            SET_RED_LED(true);
+        }
+    }
+    // Go to check mode
+    SET_IR_ACTIVE(true);
+    gIrCount = 0;
+    gSenseCount = 0;
+    // Turn interrupt for sense high to low
+    gHandSensed = false;
+    P1IE |= P1_IPIN_IR_SENSE;
+    // Waiting a moment to go into check mode (instead of just dropping right into it)
+    // This will allow the IR active line to go high before first entry
+    NEXT_MODE_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_IR_CHECK);
+}
+
+inline void timerModeIrCheck()
+{
+    if (GET_IR_PULSE())
+    {
+        // Currently high; check if hand is sensed or if we are done waiting
+        ++gIrCount;
+        if (gHandSensed)
+        {
+            // Hand is sensed
+            ++gSenseCount;
+            gHandSensed = false;
+            if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
             {
-                // Turn on red LED which should be shut off in one of:
-                // - Next TIMER_MODE_IR_WAIT entry on call to ALL_OUTPUTS_OFF()
-                // - In TIMER_MODE_IR_CHECK when dispense entered
-                // - When device is powered off
-                SET_RED_LED(true);
+                // Passed threshold; dispense and wait for hand to clear
+                SET_RED_LED(false); // In case we were blinking for low batt from check in TIMER_MODE_IR_WAIT
+                SET_WHITE_LED(true);
+                gDispenseTime = 0;
+                SET_IR_ACTIVE(false);
+                SET_PUMP(true);
+                NEXT_MODE_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_DISPENSE);
             }
         }
-        // Go to check mode
-        SET_IR_ACTIVE(true);
-        gIrCount = 0;
-        gSenseCount = 0;
-        // Turn interrupt for sense high to low
-        gHandSensed = false;
-        P1IE |= P1_IPIN_IR_SENSE;
-        // Waiting a moment to go into check mode (instead of just dropping right into it)
-        // This will allow the sense line to go high before first entry
-        NEXT_MODE_ON_EXIT_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_IR_CHECK);
-        break;
-    case TIMER_MODE_IR_CHECK:
-        if (gIrCount < IR_SENSE_TRANSITIONS)
+        else if (gIrCount >= IR_SENSE_PULSES || gSenseCount + IR_SENSE_PULSES - gIrCount < IR_ACTIVATION_THRESHOLD)
         {
-            ++gIrCount;
-            if (GET_IR_PULSE())
-            {
-                // Currently high; check if hand is sensed then go low
-                if (gHandSensed)
-                {
-                    // Hand is sensed
-                    ++gSenseCount;
-                    gHandSensed = false;
-                    if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
-                    {
-                        // Passed threshold; dispense and wait for hand to clear
-                        SET_RED_LED(false); // In case we were blinking for low batt from check in TIMER_MODE_IR_WAIT
-                        SET_WHITE_LED(true);
-                        gDispenseTime = 0;
-                        gSenseCount = 0;
-                        gSensorUnblockCount = 0;
-                        SET_PUMP(true);
-                        NEXT_MODE_ON_EXIT_COUNTS(IR_CHECK_COUNTER, TIMER_MODE_DISPENSE);
-                    }
-                }
-                SET_IR_PULSE(false);
-            }
-            else
-            {
-                // Go high then wait for next interrupt
-                SET_IR_PULSE(true);
-            }
-        }
-        else
-        {
-            // All pulses were made without sensing hand; stop and go to wait state
+            // All pulses were made without sensing hand or there is no way to reach the threshold with subsequent pulses
+            // Stop and go to wait state
             outputIrStop();
-            NEXT_MODE_ON_EXIT_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+            NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
         }
-        break;
-    case TIMER_MODE_DISPENSE:
-        ++gDispenseTime;
+    }
+    TOGGLE_IR_PULSE();
+}
+
+inline void timerModeDispense()
+{
+    ++gDispenseTime;
+    // Have we reached the minimum 0.9s threshold?
+    if (gDispenseTime == MIN_DISPENSE_COUNT)
+    {
+        // Activate IR and reset counts/flag because we will begin to pulse it on the next cycle
+        SET_IR_ACTIVE(true);
+        SET_IR_PULSE(false);
+        gSenseCount = 0;
+        gSensorUnblockCount = 0;
+        gHandSensed = false;
+    }
+    else if (gDispenseTime > MIN_DISPENSE_COUNT)
+    {
         // Are we done sensing for the hand yet? (wait for hand to be removed)
         if (gSenseCount < IR_DEACTIVATION_THRESHOLD)
         {
@@ -264,7 +266,7 @@ __interrupt void Timer_A0(void)
                     {
                         // Passed threshold; we no longer need to wait
                         outputIrStop();
-                        gSenseCount = 0x7F; // Max int8
+                        gSenseCount = 0x7FFF; // Max int16
                     }
                 }
                 else
@@ -273,55 +275,64 @@ __interrupt void Timer_A0(void)
                     gSenseCount = 0;
                     gHandSensed = false;
                 }
-                SET_IR_PULSE(false);
             }
-            else
-            {
-                SET_IR_PULSE(true);
-            }
+            TOGGLE_IR_PULSE();
         }
-        // Have we reached the minimum 0.9s threshold?
-        if (gDispenseTime > MIN_DISPENSE_COUNT)
+        // Is the hand now removed from the sensor?
+        if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
         {
-            // Is the hand now removed from the sensor?
-            if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
-            {
-                // We are done dispensing
-                ALL_OUTPUTS_OFF();
-                NEXT_MODE_ON_EXIT_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
-                // Force battery check on IR wait entry
-                gBattWaitCount = CHECK_BATT_COUNT;
-            }
-            // Have we reached the maximum 1.8s threshold?
-            else if (gDispenseTime > MAX_DISPENSE_COUNT)
-            {
-                // Turn off the pump, but we aren't done "dispensing" until hand is removed.
-                SET_PUMP(false);
-                SET_WHITE_LED(false);
-                // Just to make sure this counter is now pegged for next loop
-                gDispenseTime = MAX_DISPENSE_COUNT;
-                // Blink red LED if hand continues to be sensed for an extended period of time
-                if (gSensorUnblockCount == IM_WAITING_BLINK_START_COUNT)
-                {
-                    SET_RED_LED(true);
-                }
-                else if (gSensorUnblockCount == IM_WAITING_BLINK_LENGTH_COUNT)
-                {
-                    SET_RED_LED(false);
-                }
-                else if (gSensorUnblockCount >= IM_WAITING_BLINK_DELAY_COUNT)
-                {
-                    // Reset counter so it continues to blink
-                    gSensorUnblockCount = IM_WAITING_BLINK_START_COUNT - 1;
-                }
-                ++gSensorUnblockCount;
-            }
+            // We are done dispensing
+            ALL_OUTPUTS_OFF();
+            NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+            // Force battery check on IR wait entry
+            gBattWaitCount = CHECK_BATT_COUNT;
         }
+        // Have we reached the maximum 1.8s threshold?
+        else if (gDispenseTime > MAX_DISPENSE_COUNT)
+        {
+            // Turn off the pump, but we aren't done "dispensing" until hand is removed.
+            SET_PUMP(false);
+            SET_WHITE_LED(false);
+            // Just to make sure this counter is now pegged for next loop
+            gDispenseTime = MAX_DISPENSE_COUNT;
+            // Blink red LED if hand continues to be sensed for an extended period of time
+            if (gSensorUnblockCount == IM_WAITING_BLINK_START_COUNT)
+            {
+                SET_RED_LED(true);
+            }
+            else if (gSensorUnblockCount == IM_WAITING_BLINK_LENGTH_COUNT)
+            {
+                SET_RED_LED(false);
+            }
+            else if (gSensorUnblockCount >= IM_WAITING_BLINK_DELAY_COUNT)
+            {
+                // Reset counter so it continues to blink
+                gSensorUnblockCount = IM_WAITING_BLINK_START_COUNT - 1;
+            }
+            ++gSensorUnblockCount;
+        }
+    }
+}
+
+//Timer ISR
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer_A0(void)
+{
+    switch(gTimerMode)
+    {
+    case TIMER_MODE_IR_WAIT:
+        timerModeWait();
+        break;
+    case TIMER_MODE_IR_CHECK:
+        timerModeIrCheck();
+        break;
+    case TIMER_MODE_DISPENSE:
+        timerModeDispense();
         break;
     case TIMER_MODE_ENTER_RUN:
         // Enter run mode
         ALL_OUTPUTS_OFF();
-        NEXT_MODE_ON_EXIT_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
+        NEXT_MODE_MS(IR_WAIT_PERIOD_MS, TIMER_MODE_IR_WAIT);
         break;
     case TIMER_MODE_EXIT_RUN: // Fall through
     case TIMER_MODE_NONE: // Fall through
@@ -331,7 +342,7 @@ __interrupt void Timer_A0(void)
         ALL_OUTPUTS_OFF();
         SET_RED_LED(false);
         __delay_cycles(5); // I think this helps to make sure outputs are set before going into LPM4
-        LPM4_ON_EXIT(); // Go to LPM4 on exit of this interrupt (LPM4_EXIT only on button press)
+        DISABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM3 to LPM4
         // On exit: the only interrupt accessible is for button press
         break;
     }
@@ -352,15 +363,15 @@ __interrupt void Port_1(void)
           // Go from on to off
           ALL_OUTPUTS_OFF();
           SET_RED_LED(true);
-          NEXT_MODE_ON_EXIT_MS(OFF_LED_TIME_MS, TIMER_MODE_EXIT_RUN);
+          NEXT_MODE_MS(OFF_LED_TIME_MS, TIMER_MODE_EXIT_RUN);
       }
       else
       {
           // Go from off to on
-          LPM4_EXIT; // Exit LPM4
           ALL_OUTPUTS_OFF();
           SET_WHITE_LED(true);
-          NEXT_MODE_ON_EXIT_MS(ON_LED_TIME_MS, TIMER_MODE_ENTER_RUN);
+          NEXT_MODE_MS(ON_LED_TIME_MS, TIMER_MODE_ENTER_RUN);
+          ENABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM4 to LPM3
       }
       // Toggle to new state
       gPowerState = !gPowerState;
