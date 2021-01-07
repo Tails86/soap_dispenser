@@ -85,7 +85,7 @@ inline void timerModeDispense();
 // Definitions for red LED blink to inform the user the sensor was never unblocked
 #define IM_WAITING_BLINK_START_DELAY_MS 3000
 #define IM_WAITING_BLINK_LENGTH_MS 100
-#define IM_WAITING_BLINK_DELAY_MS 3000
+#define IM_WAITING_BLINK_DELAY_MS 2000
 
 // Period of time in between each check (this is also how long red LED will flash on low batt)
 #define IR_WAIT_PERIOD_MS 333
