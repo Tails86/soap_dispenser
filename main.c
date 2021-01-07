@@ -1,7 +1,14 @@
 #include <msp430.h> 
 #include <stdint.h>
 #include <stdbool.h>
+// VLO library found on TI website
+// Application Report: https://www.ti.com/lit/an/slaa340a/slaa340a.pdf
+// Library download location: http://www.ti.com/lit/zip/slaa340
+// Refer to the copyright notice in VLO_Library.asm.
+// This library allows me to use the Very Low Oscillator (VLO) with greater timing precision.
+#include "VLO_Library.h"
 
+inline void calibrate();
 inline void nextMode(int8_t mode);
 inline void outputIrStop();
 inline bool isBattLow();
@@ -28,38 +35,45 @@ inline void timerModeDispense();
 #define GET_IR_PULSE() GET_PINS(P1OUT, P1_OPIN_IR_PULSE)
 
 // Setter macros
-#define SET_OUTPUT(port, mask, on) (on ? (port |= mask) : (port &= ~mask))
-#define TOGGLE_OUTPUT(port, mask) (port ^= mask)
+#define SET_OUTPUT_ON(port, mask) (port |= mask)
+#define SET_OUTPUT_OFF(port, mask) (port &= ~mask)
+#define SET_OUTPUT(port, mask, on) (on ? SET_OUTPUT_ON(port, mask) : SET_OUTPUT_OFF(port, mask))
 #define SET_WHITE_LED(on) SET_OUTPUT(P1OUT, P1_OPIN_WHITE_LED, on)
 #define SET_RED_LED(on) SET_OUTPUT(P1OUT, P1_OPIN_RED_LED, on)
 #define SET_IR_ACTIVE(on) SET_OUTPUT(P1OUT, P1_OPIN_IR_ACTIVE, on)
 #define SET_PUMP(on) SET_OUTPUT(P1OUT, P1_OPIN_PUMP, on)
 #define SET_IR_PULSE(on) SET_OUTPUT(P1OUT, P1_OPIN_IR_PULSE, on)
-#define TOGGLE_IR_PULSE() TOGGLE_OUTPUT(P1OUT, P1_OPIN_IR_PULSE)
 // All control IO are on port 1
-#define ALL_OUTPUTS_OFF() P1OUT &= ~ALL_P1_OUTPUTS_MASK
+#define ALL_OUTPUTS_OFF() SET_OUTPUT_OFF(P1OUT, ALL_P1_OUTPUTS_MASK)
 
-// External crystal frequency
-#define ACLK_FREQ 32768
+// Min/max VLO frequencies from specs
+#define MIN_VLO_FREQUENCY 4000
+#define MAX_VLO_FREQUENCY 20000
+// The clock frequency the VLO count is relative to (coded into VLO_Library.asm)
+#define VLO_COUNT_REL_CLOCK_FREQUENCY 8000000
+// Computed min and max VLO counts
+#define MIN_VLO_COUNT (VLO_COUNT_REL_CLOCK_FREQUENCY / MAX_VLO_FREQUENCY) // 400
+#define MAX_VLO_COUNT (VLO_COUNT_REL_CLOCK_FREQUENCY / MIN_VLO_FREQUENCY) // 2000
+
 // Enable or disable oscillator on exit of interrupt (the difference between LPM3 and LPM4)
 #define ENABLE_OSCILLATOR_ON_EXIT() __bic_SR_register_on_exit(OSCOFF)
 #define DISABLE_OSCILLATOR_ON_EXIT() __bis_SR_register_on_exit(OSCOFF)
-// Converts milliseconds to clock counts for CCR0 (float math only done by precompiler)
-#define MS_TO_COUNTS(ms) ((ms / 1000.0) * ACLK_FREQ - 1)
+// Converts milliseconds to clock counts for CCR0
+#define MS_TO_COUNTS(ms, cal) (VLO_COUNT_REL_CLOCK_FREQUENCY / 1000 * ms / cal - 1)
 
 // Length of time to turn on the ON LED and OFF LED
 #define ON_LED_TIME_MS 1000
 #define OFF_LED_TIME_MS 1000
 
-// Frequency and counter value for IR sensor
-#define IR_FREQUNCY 2340
-#define IR_CHECK_COUNTER ACLK_FREQ / IR_FREQUNCY / 2 - 1
+// Frequency value for IR sensor
+#define MAX_IR_FREQUENCY 2800
+// This will compute a counter for a frequency up to IR_FREQUENCY
+#define COMPUTE_IR_CHECK_COUNTER(cal) (VLO_COUNT_REL_CLOCK_FREQUENCY / 2 / MAX_IR_FREQUENCY / cal)
 
 // Definitions of how many pulses we make for each IR check
 #define IR_SENSE_PULSES 5
 // Number of pulses within IR_SENSE_PULSES that must have sense before activation
 #define IR_ACTIVATION_THRESHOLD 3
-#define MAX_IR_SENSE_TIME_MS (IR_SENSE_PULSES * 1000 / IR_FREQUNCY)
 #if IR_ACTIVATION_THRESHOLD >= IR_SENSE_PULSES
 #error "activation value must be less than IR_ACTIVATION_THRESHOLD"
 #endif
@@ -67,28 +81,40 @@ inline void timerModeDispense();
 // Definitions for dispense
 // The number of CONSECUTIVE pulses while dispensing must not have sense before deactivation
 #define IR_DEACTIVATION_THRESHOLD 200
-#define MIN_DISPENSE_TIME_S 0.1
-#define MAX_DISPENSE_TIME_S 1.8
-// Need to multiply this by 2 because the counts are incremented on each state transition
-#define MIN_DISPENSE_COUNT (int16_t)(MIN_DISPENSE_TIME_S * IR_FREQUNCY * 2)
-#define MAX_DISPENSE_COUNT (int16_t)(MAX_DISPENSE_TIME_S * IR_FREQUNCY * 2)
+#define MAX_DISPENSE_TIME_MS 1800
 // Definitions for red LED blink to inform the user the sensor was never unblocked
 #define IM_WAITING_BLINK_START_DELAY_MS 3000
 #define IM_WAITING_BLINK_LENGTH_MS 100
 #define IM_WAITING_BLINK_DELAY_MS 3000
-#define IM_WAITING_BLINK_START_COUNT (int16_t)(IM_WAITING_BLINK_START_DELAY_MS / 1000.0 * IR_FREQUNCY * 2)
-#define IM_WAITING_BLINK_LENGTH_COUNT (int16_t)(IM_WAITING_BLINK_START_COUNT + (IM_WAITING_BLINK_LENGTH_MS / 1000.0 * IR_FREQUNCY * 2))
-#define IM_WAITING_BLINK_DELAY_COUNT (int16_t)(IM_WAITING_BLINK_LENGTH_COUNT + (IM_WAITING_BLINK_DELAY_MS / 1000.0 * IR_FREQUNCY * 2))
 
 // Period of time in between each check (this is also how long red LED will flash on low batt)
-#define IR_WAIT_PERIOD_MS 400
+#define IR_WAIT_PERIOD_MS 333
 
 // Definitions for battery detect
 #define CHECK_BATT_PERIOD_S 10
-#define CHECK_BATT_COUNT (int16_t)(CHECK_BATT_PERIOD_S * 1000 / (IR_WAIT_PERIOD_MS + MAX_IR_SENSE_TIME_MS))
+#define CHECK_BATT_COUNT (int16_t)(CHECK_BATT_PERIOD_S * 1000 / IR_WAIT_PERIOD_MS)
 
 // Defines how many consecutive power ons are necessary to enable prank mode
 #define PRANK_MODE_POWER_ON_COUNT 3
+
+// States for blinking the LED as we're waiting for the user to remove hand
+#define IM_WAITING_BLINK_START 0
+#define IM_WAITING_BLINK_ON1   1
+#define IM_WAITING_BLINK_OFF1  2
+#define IM_WAITING_BLINK_ON2   3
+#define IM_WAITING_BLINK_OFF2  4
+#define IM_WAITING_BLINK_MAX   5
+// The number of counts to wait before moving to next state
+// These are approximations since they are computed using MAX_IR_FREQUENCY instead of actual freq.
+int16_t gImWaitingCounts[5] = {
+    (int16_t)(IM_WAITING_BLINK_START_DELAY_MS / 1000.0 * MAX_IR_FREQUENCY * 2),
+    (int16_t)(IM_WAITING_BLINK_LENGTH_MS / 1000.0 * MAX_IR_FREQUENCY * 2),
+    (int16_t)(IM_WAITING_BLINK_LENGTH_MS / 1000.0 * MAX_IR_FREQUENCY * 2),
+    (int16_t)(IM_WAITING_BLINK_LENGTH_MS / 1000.0 * MAX_IR_FREQUENCY * 2),
+    (int16_t)(IM_WAITING_BLINK_DELAY_MS / 1000.0 * MAX_IR_FREQUENCY * 2)
+};
+// The current state
+uint8_t gImWaitingState = IM_WAITING_BLINK_START;
 
 // State machine modes
 #define TIMER_MODE_IR_WAIT      0
@@ -98,19 +124,14 @@ inline void timerModeDispense();
 #define TIMER_MODE_EXIT_RUN     4
 #define TIMER_MODE_NONE         5
 // The max timer counter for each of the above modes
-int16_t gModeCounterLookup[5] = {
-    MS_TO_COUNTS(IR_WAIT_PERIOD_MS),
-    IR_CHECK_COUNTER,
-    IR_CHECK_COUNTER,
-    MS_TO_COUNTS(ON_LED_TIME_MS),
-    MS_TO_COUNTS(OFF_LED_TIME_MS)
-};
-
+int16_t gModeCounterLookup[5] = {0};
 // Current state machine mode
 int8_t gTimerMode = TIMER_MODE_NONE;
 
 // Current power state (true=ON; false=OFF)
 bool gPowerState = false;
+// The maximum dispense count as computed in calibrate()
+uint16_t gMaxDispenseCount = 0;
 // Current IR state count
 int8_t gIrCount = 0;
 // Number of pulses where hand is sensed
@@ -118,7 +139,7 @@ int16_t gSenseCount = 0;
 // Set by hand sense input interrupt
 bool gHandSensed = false;
 // Current dispense time counter (used in TIMER_MODE_DISPENSE)
-int16_t gDispenseTime = 0;
+uint16_t gDispenseTime = 0;
 // Wait counter for battery detection activation
 int16_t gBattWaitCount = 0;
 // Counter used to keep track of how long we have been waiting
@@ -135,19 +156,23 @@ int main(void)
     WDTCTL = WDTPW | WDTHOLD;   // stop watchdog timer
     BCSCTL1 = CALBC1_1MHZ;      // Set range   DCOCTL = CALDCO_1MHZ;
     BCSCTL2 &= ~(DIVS_3);       // SMCLK = DCO = 1MHz
+    // Set ACLK to internal VLO (4-20 kHz, typ=12kHz)
+    BCSCTL3 &= ~LFXT1S0;
+    BCSCTL3 |= LFXT1S1;
+    BCSCTL1 &= ~XTS;
     // All P1 setup for GPIO
     P1SEL = 0;
     P1SEL2 = 0;
+    // Nothing on P2
+    P2SEL = 0;
+    P2SEL2 = 0;
     // Setup P1 outputs
     P1OUT = 0;
     P1DIR = ALL_P1_OUTPUTS_MASK;
-    // Timer 0 control
-    CCTL0 = 0;                  // Timer interrupt initially disabled
-    CCR0 = 7 - 1;
-    TA0CTL = TASSEL_1 | MC_1;   // ACLK, up mode
     // Button interrupt on low to high; IR sense from high to low but not enabled here
     P1IE = P1_IPIN_BUTTON;
     P1IES = P1_IPIN_IR_SENSE;
+
 
     while(1)
     {
@@ -160,6 +185,23 @@ int main(void)
 
     // Unreachable
     return 0;
+}
+
+inline void calibrate()
+{
+    // This is some pretty intensive calculations for a microcontroller, but they only happen during
+    // power on!
+    unsigned int vloValue = TI_measureVLO();
+    int16_t irCheckCounter = COMPUTE_IR_CHECK_COUNTER(vloValue);
+    gModeCounterLookup[TIMER_MODE_IR_WAIT] = MS_TO_COUNTS(IR_WAIT_PERIOD_MS, vloValue);
+    gModeCounterLookup[TIMER_MODE_IR_CHECK] = irCheckCounter;
+    gModeCounterLookup[TIMER_MODE_DISPENSE] = irCheckCounter;
+    gModeCounterLookup[TIMER_MODE_ENTER_RUN] = MS_TO_COUNTS(ON_LED_TIME_MS, vloValue);
+    gModeCounterLookup[TIMER_MODE_EXIT_RUN] = MS_TO_COUNTS(OFF_LED_TIME_MS, vloValue);
+    gMaxDispenseCount = MAX_DISPENSE_TIME_MS * (VLO_COUNT_REL_CLOCK_FREQUENCY / 1000) / vloValue / (irCheckCounter + 1);
+    // Timer 0 control
+    CCTL0 = 0;                  // Timer interrupt disabled
+    TA0CTL = TASSEL_1 | MC_1;   // ACLK, up mode
 }
 
 inline void nextMode(int8_t mode)
@@ -229,14 +271,16 @@ inline void timerModeIrCheck()
         {
             // Hand is sensed
             ++gSenseCount;
-            gHandSensed = false;
             if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
             {
                 // Passed threshold; dispense and wait for hand to clear
                 SET_RED_LED(false); // In case we were blinking for low batt from check in TIMER_MODE_IR_WAIT
                 SET_WHITE_LED(true);
                 gDispenseTime = 0;
-                SET_IR_ACTIVE(false);
+                gSenseCount = 0;
+                gSensorUnblockCount = 0;
+                gHandSensed = false;
+                gImWaitingState = IM_WAITING_BLINK_START;
                 SET_PUMP(true);
                 if (gPrankModeEnabled)
                 {
@@ -256,8 +300,16 @@ inline void timerModeIrCheck()
             outputIrStop();
             nextMode(TIMER_MODE_IR_WAIT);
         }
+        // Pulse goes low
+        SET_IR_PULSE(false);
     }
-    TOGGLE_IR_PULSE();
+    else
+    {
+        // Sense should happen about 30 us after false->true transition if hand is there
+        gHandSensed = false;
+        // Pulse goes high
+        SET_IR_PULSE(true);
+    }
 }
 
 inline void prankDispense()
@@ -291,77 +343,69 @@ inline void prankDispense()
 inline void timerModeDispense()
 {
     ++gDispenseTime;
-    // Have we reached the minimum 0.9s threshold?
-    if (gDispenseTime == MIN_DISPENSE_COUNT)
+    // Are we done sensing for the hand yet? (wait for hand to be removed)
+    if (gSenseCount < IR_DEACTIVATION_THRESHOLD)
     {
-        // Activate IR and reset counts/flag because we will begin to pulse it on the next cycle
-        SET_IR_ACTIVE(true);
-        SET_IR_PULSE(false);
-        gSenseCount = 0;
-        gSensorUnblockCount = 0;
-        gHandSensed = false;
+        if (GET_IR_PULSE())
+        {
+            // Currently high; check if hand is no longer sensed then go low
+            if (!gHandSensed)
+            {
+                // Hand is not sensed
+                ++gSenseCount;
+                if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
+                {
+                    // Passed threshold; we no longer need to wait
+                    outputIrStop();
+                    gSenseCount = 0x7FFF; // Max int16
+                }
+            }
+            else
+            {
+                // Reset sense count to enforce that we get consecutive samples
+                gSenseCount = 0;
+            }
+            // Pulse goes low
+            SET_IR_PULSE(false);
+        }
+        else
+        {
+            // Sense should happen about 30 us after false->true transition if hand is there
+            gHandSensed = false;
+            // Pulse goes high
+            SET_IR_PULSE(true);
+        }
     }
-    else if (gDispenseTime > MIN_DISPENSE_COUNT)
+    // Is the hand now removed from the sensor?
+    if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
     {
-        // Are we done sensing for the hand yet? (wait for hand to be removed)
-        if (gSenseCount < IR_DEACTIVATION_THRESHOLD)
+        // We are done dispensing
+        ALL_OUTPUTS_OFF();
+        nextMode(TIMER_MODE_IR_WAIT);
+        // Force battery check on IR wait entry
+        gBattWaitCount = CHECK_BATT_COUNT;
+    }
+    // Have we reached the maximum 1.8s threshold?
+    else if (gDispenseTime >= gMaxDispenseCount)
+    {
+        // Turn off the pump, but we aren't done "dispensing" until hand is removed.
+        SET_PUMP(false);
+        SET_WHITE_LED(false);
+        // Just to make sure this counter is now pegged for next loop
+        gDispenseTime = gMaxDispenseCount - 1;
+        // Blink red LED if hand continues to be sensed for an extended period of time
+        if (gSensorUnblockCount >= gImWaitingCounts[gImWaitingState])
         {
-            if (GET_IR_PULSE())
+            // go to next state
+            ++gImWaitingState;
+            if (gImWaitingState >= IM_WAITING_BLINK_MAX)
             {
-                // Currently high; check if hand is no longer sensed then go low
-                if (!gHandSensed)
-                {
-                    // Hand is not sensed
-                    ++gSenseCount;
-                    if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
-                    {
-                        // Passed threshold; we no longer need to wait
-                        outputIrStop();
-                        gSenseCount = 0x7FFF; // Max int16
-                    }
-                }
-                else
-                {
-                    // Reset sense count to enforce that we get consecutive samples
-                    gSenseCount = 0;
-                    gHandSensed = false;
-                }
+                gImWaitingState = IM_WAITING_BLINK_ON1;
             }
-            TOGGLE_IR_PULSE();
+            SET_RED_LED(gImWaitingState == IM_WAITING_BLINK_ON1 || gImWaitingState == IM_WAITING_BLINK_ON2);
+            gSensorUnblockCount = 0;
         }
-        // Is the hand now removed from the sensor?
-        if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
-        {
-            // We are done dispensing
-            ALL_OUTPUTS_OFF();
-            nextMode(TIMER_MODE_IR_WAIT);
-            // Force battery check on IR wait entry
-            gBattWaitCount = CHECK_BATT_COUNT;
-        }
-        // Have we reached the maximum 1.8s threshold?
-        else if (gDispenseTime > MAX_DISPENSE_COUNT)
-        {
-            // Turn off the pump, but we aren't done "dispensing" until hand is removed.
-            SET_PUMP(false);
-            SET_WHITE_LED(false);
-            // Just to make sure this counter is now pegged for next loop
-            gDispenseTime = MAX_DISPENSE_COUNT;
-            // Blink red LED if hand continues to be sensed for an extended period of time
-            if (gSensorUnblockCount == IM_WAITING_BLINK_START_COUNT)
-            {
-                SET_RED_LED(true);
-            }
-            else if (gSensorUnblockCount == IM_WAITING_BLINK_LENGTH_COUNT)
-            {
-                SET_RED_LED(false);
-            }
-            else if (gSensorUnblockCount >= IM_WAITING_BLINK_DELAY_COUNT)
-            {
-                // Reset counter so it continues to blink
-                gSensorUnblockCount = IM_WAITING_BLINK_START_COUNT - 1;
-            }
-            ++gSensorUnblockCount;
-        }
+        ++gSensorUnblockCount;
     }
 }
 
@@ -437,6 +481,7 @@ __interrupt void Port_1(void)
           }
           ALL_OUTPUTS_OFF();
           SET_WHITE_LED(true);
+          calibrate(); // Calibrate timer
           nextMode(TIMER_MODE_ENTER_RUN);
           ENABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM4 to LPM3
       }
