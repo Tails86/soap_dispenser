@@ -9,7 +9,7 @@
 #include "VLO_Library.h"
 
 inline void calibrate();
-inline void nextMode(int8_t mode);
+inline void nextMode(uint8_t mode);
 inline void outputIrStop();
 inline bool isBattLow();
 inline void timerModeWait();
@@ -228,7 +228,7 @@ inline void calibrate()
     TA0CTL = TASSEL_1 | MC_1;   // ACLK, up mode
 }
 
-inline void nextMode(int8_t mode)
+inline void nextMode(uint8_t mode)
 {
     CCTL0 = 0; // Make sure interrupt is disabled
     gTimerMode = mode;
@@ -377,6 +377,7 @@ inline void timerModeIrCheck()
 
 inline void timerModePrankDispense()
 {
+    static uint8_t prankLoop = 0;
     ++gDispenseTime;
     switch (gPrankState)
     {
@@ -392,6 +393,7 @@ inline void timerModePrankDispense()
             SET_IR_ACTIVE(false);
             ++gPrankState;
             gDispenseTime = 0;
+            prankLoop = 0;
         }
         break;
     case 1:
@@ -469,9 +471,16 @@ inline void timerModePrankDispense()
             gHandSensed = false;
             gSenseCount = 0;
             P1IE |= P1_IPIN_IR_SENSE;
-            // Go to next state
+            // Go to next state or back to 1
             gDispenseTime = 0;
-            ++gPrankState;
+            if (prankLoop++ >= 3)
+            {
+                ++gPrankState;
+            }
+            else
+            {
+                gPrankState = 1;
+            }
         }
         break;
     case 4:
