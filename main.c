@@ -13,8 +13,9 @@ inline void nextMode(int8_t mode);
 inline void outputIrStop();
 inline bool isBattLow();
 inline void timerModeWait();
+inline bool isHandRemoved();
 inline void timerModeIrCheck();
-inline void prankDispense();
+inline void timerModePrankDispense();
 inline void timerModeDispense();
 
 // Pin definitions
@@ -60,6 +61,8 @@ inline void timerModeDispense();
 #define DISABLE_OSCILLATOR_ON_EXIT() __bis_SR_register_on_exit(OSCOFF)
 // Converts milliseconds to clock counts for CCR0
 #define MS_TO_COUNTS(ms, cal) (VLO_COUNT_REL_CLOCK_FREQUENCY / 1000 * ms / cal - 1)
+// Converts milliseconds to IR cycles
+#define MS_TO_IR_CYCLES(ms, vloValue, irCheckCounter) (ms * (VLO_COUNT_REL_CLOCK_FREQUENCY / 1000) / vloValue / (irCheckCounter + 1))
 
 // Length of time to turn on the ON LED and OFF LED
 #define ON_LED_TIME_MS 1000
@@ -97,6 +100,17 @@ inline void timerModeDispense();
 // Defines how many consecutive power ons are necessary to enable prank mode
 #define PRANK_MODE_POWER_ON_COUNT 3
 
+// The amount of time to dispense into hand
+#define PRANK_DISPENSE_TIME1_MS 200
+// The amount of time to wait after hand is removed before moving to 3
+#define PRANK_DISPENSE_TIME2_MS 300
+// The maximum amount of time to dispense until hand is placed back on the sensor
+#define PRANK_DISPENSE_TIME3_MS 5000
+// The amount of time to dispense after the hand is removed a second time
+#define PRANK_DISPENSE_TIME4_MS 10000
+// The number of prank states
+#define PRANK_STATE_COUNT 5
+
 // States for blinking the LED as we're waiting for the user to remove hand
 #define IM_WAITING_BLINK_START 0
 #define IM_WAITING_BLINK_ON1   1
@@ -117,14 +131,15 @@ int16_t gImWaitingCounts[5] = {
 uint8_t gImWaitingState = IM_WAITING_BLINK_START;
 
 // State machine modes
-#define TIMER_MODE_IR_WAIT      0
-#define TIMER_MODE_IR_CHECK     1
-#define TIMER_MODE_DISPENSE     2
-#define TIMER_MODE_ENTER_RUN    3
-#define TIMER_MODE_EXIT_RUN     4
-#define TIMER_MODE_NONE         5
+#define TIMER_MODE_IR_WAIT        0
+#define TIMER_MODE_IR_CHECK       1
+#define TIMER_MODE_DISPENSE       2
+#define TIMER_MODE_PRANK_DISPENSE 3
+#define TIMER_MODE_ENTER_RUN      4
+#define TIMER_MODE_EXIT_RUN       5
+#define TIMER_MODE_NONE           6
 // The max timer counter for each of the above modes
-int16_t gModeCounterLookup[5] = {0};
+int16_t gModeCounterLookup[6] = {0};
 // Current state machine mode
 int8_t gTimerMode = TIMER_MODE_NONE;
 
@@ -132,6 +147,10 @@ int8_t gTimerMode = TIMER_MODE_NONE;
 bool gPowerState = false;
 // The maximum dispense count as computed in calibrate()
 uint16_t gMaxDispenseCount = 0;
+// The dispense counts for prank mode
+uint16_t gPrankDispenseCounts[4] = {0};
+// Thur current prank state
+uint8_t gPrankState = PRANK_STATE_COUNT;
 // Current IR state count
 int8_t gIrCount = 0;
 // Number of pulses where hand is sensed
@@ -196,9 +215,14 @@ inline void calibrate()
     gModeCounterLookup[TIMER_MODE_IR_WAIT] = MS_TO_COUNTS(IR_WAIT_PERIOD_MS, vloValue);
     gModeCounterLookup[TIMER_MODE_IR_CHECK] = irCheckCounter;
     gModeCounterLookup[TIMER_MODE_DISPENSE] = irCheckCounter;
+    gModeCounterLookup[TIMER_MODE_PRANK_DISPENSE] = irCheckCounter;
     gModeCounterLookup[TIMER_MODE_ENTER_RUN] = MS_TO_COUNTS(ON_LED_TIME_MS, vloValue);
     gModeCounterLookup[TIMER_MODE_EXIT_RUN] = MS_TO_COUNTS(OFF_LED_TIME_MS, vloValue);
-    gMaxDispenseCount = MAX_DISPENSE_TIME_MS * (VLO_COUNT_REL_CLOCK_FREQUENCY / 1000) / vloValue / (irCheckCounter + 1);
+    gMaxDispenseCount = MS_TO_IR_CYCLES(MAX_DISPENSE_TIME_MS, vloValue, irCheckCounter);
+    gPrankDispenseCounts[0] = MS_TO_IR_CYCLES(PRANK_DISPENSE_TIME1_MS, vloValue, irCheckCounter);
+    gPrankDispenseCounts[1] = MS_TO_IR_CYCLES(PRANK_DISPENSE_TIME2_MS, vloValue, irCheckCounter);
+    gPrankDispenseCounts[2] = MS_TO_IR_CYCLES(PRANK_DISPENSE_TIME3_MS, vloValue, irCheckCounter);
+    gPrankDispenseCounts[3] = MS_TO_IR_CYCLES(PRANK_DISPENSE_TIME4_MS, vloValue, irCheckCounter);
     // Timer 0 control
     CCTL0 = 0;                  // Timer interrupt disabled
     TA0CTL = TASSEL_1 | MC_1;   // ACLK, up mode
@@ -261,88 +285,8 @@ inline void timerModeWait()
     nextMode(TIMER_MODE_IR_CHECK);
 }
 
-inline void timerModeIrCheck()
+inline bool isHandRemoved()
 {
-    if (GET_IR_PULSE())
-    {
-        // Currently high; check if hand is sensed or if we are done waiting
-        ++gIrCount;
-        if (gHandSensed)
-        {
-            // Hand is sensed
-            ++gSenseCount;
-            if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
-            {
-                // Passed threshold; dispense and wait for hand to clear
-                SET_RED_LED(false); // In case we were blinking for low batt from check in TIMER_MODE_IR_WAIT
-                SET_WHITE_LED(true);
-                gDispenseTime = 0;
-                gSenseCount = 0;
-                gSensorUnblockCount = 0;
-                gHandSensed = false;
-                gImWaitingState = IM_WAITING_BLINK_START;
-                SET_PUMP(true);
-                if (gPrankModeEnabled)
-                {
-                    // Do prank mode dispense right in line (no way to power off)
-                    prankDispense();
-                }
-                else
-                {
-                    nextMode(TIMER_MODE_DISPENSE);
-                }
-            }
-        }
-        else if (gIrCount >= IR_SENSE_PULSES || gSenseCount + IR_SENSE_PULSES - gIrCount < IR_ACTIVATION_THRESHOLD)
-        {
-            // All pulses were made without sensing hand or there is no way to reach the threshold with subsequent pulses
-            // Stop and go to wait state
-            outputIrStop();
-            nextMode(TIMER_MODE_IR_WAIT);
-        }
-        // Pulse goes low
-        SET_IR_PULSE(false);
-    }
-    else
-    {
-        // Sense should happen about 30 us after false->true transition if hand is there
-        gHandSensed = false;
-        // Pulse goes high
-        SET_IR_PULSE(true);
-    }
-}
-
-inline void prankDispense()
-{
-    SET_PUMP(true);
-    SET_WHITE_LED(true);
-    __delay_cycles(1000000);
-    SET_PUMP(false);
-    SET_WHITE_LED(false);
-    __delay_cycles(3000000);
-    SET_PUMP(true);
-    SET_WHITE_LED(true);
-    __delay_cycles(10000);
-    SET_PUMP(false);
-    __delay_cycles(50000);
-    SET_PUMP(true);
-    __delay_cycles(50000);
-    SET_WHITE_LED(true);
-    __delay_cycles(30000);
-    SET_WHITE_LED(false);
-    __delay_cycles(30000);
-    SET_WHITE_LED(true);
-    SET_PUMP(false);
-    __delay_cycles(3000000);
-    SET_PUMP(true);
-    __delay_cycles(3000000);
-    SET_PUMP(false);
-    SET_WHITE_LED(false);
-}
-
-inline void timerModeDispense()
-{
-    ++gDispenseTime;
     // Are we done sensing for the hand yet? (wait for hand to be removed)
     if (gSenseCount < IR_DEACTIVATION_THRESHOLD)
     {
@@ -376,8 +320,182 @@ inline void timerModeDispense()
             SET_IR_PULSE(true);
         }
     }
+    return (gSenseCount >= IR_DEACTIVATION_THRESHOLD);
+}
+
+inline void timerModeIrCheck()
+{
+    if (GET_IR_PULSE())
+    {
+        // Currently high; check if hand is sensed or if we are done waiting
+        ++gIrCount;
+        if (gHandSensed)
+        {
+            // Hand is sensed
+            ++gSenseCount;
+            if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
+            {
+                // Passed threshold; dispense and wait for hand to clear
+                SET_RED_LED(false); // In case we were blinking for low batt from check in TIMER_MODE_IR_WAIT
+                SET_WHITE_LED(true);
+                gDispenseTime = 0;
+                gSenseCount = 0;
+                gSensorUnblockCount = 0;
+                gHandSensed = false;
+                gImWaitingState = IM_WAITING_BLINK_START;
+                SET_PUMP(true);
+                if (gPrankModeEnabled)
+                {
+                    // Enter prank mode >:)
+                    gPrankState = 0;
+                    nextMode(TIMER_MODE_PRANK_DISPENSE);
+                }
+                else
+                {
+                    nextMode(TIMER_MODE_DISPENSE);
+                }
+            }
+        }
+        else if (gIrCount >= IR_SENSE_PULSES || gSenseCount + IR_SENSE_PULSES - gIrCount < IR_ACTIVATION_THRESHOLD)
+        {
+            // All pulses were made without sensing hand or there is no way to reach the threshold with subsequent pulses
+            // Stop and go to wait state
+            outputIrStop();
+            nextMode(TIMER_MODE_IR_WAIT);
+        }
+        // Pulse goes low
+        SET_IR_PULSE(false);
+    }
+    else
+    {
+        // Sense should happen about 30 us after false->true transition if hand is there
+        gHandSensed = false;
+        // Pulse goes high
+        SET_IR_PULSE(true);
+    }
+}
+
+inline void timerModePrankDispense()
+{
+    ++gDispenseTime;
+    switch (gPrankState)
+    {
+    case 0:
+        // Dispense for a short time and wait for hand to be removed
+        if (gDispenseTime >= gPrankDispenseCounts[0])
+        {
+            SET_PUMP(false);
+            SET_WHITE_LED(false);
+        }
+        if (isHandRemoved())
+        {
+            SET_IR_ACTIVE(false);
+            ++gPrankState;
+            gDispenseTime = 0;
+        }
+        break;
+    case 1:
+        // Wait for a short period
+        if (gDispenseTime >= gPrankDispenseCounts[1])
+        {
+            // Turn on the pump and move to the next state
+            SET_PUMP(true);
+            SET_WHITE_LED(true);
+            SET_IR_ACTIVE(true);
+            SET_IR_PULSE(false);
+            gHandSensed = false;
+            gSenseCount = 0;
+            P1IE |= P1_IPIN_IR_SENSE;
+            gDispenseTime = 0;
+            ++gPrankState;
+        }
+        break;
+    case 2:
+        // Dispense either for the set period or until hand is placed back under the sensor
+        if (gDispenseTime < gPrankDispenseCounts[2])
+        {
+            if (GET_IR_PULSE())
+            {
+                // Currently high; check if hand is sensed or if we are done waiting
+                if (gHandSensed)
+                {
+                    // Hand is sensed
+                    ++gSenseCount;
+                    if (gSenseCount >= IR_ACTIVATION_THRESHOLD)
+                    {
+                        // Passed threshold; stop the pump >:)
+                        SET_PUMP(false);
+                        SET_WHITE_LED(false);
+                        // Go to next state
+                        ++gPrankState;
+                        gHandSensed = false;
+                        gDispenseTime = 0;
+                        gSenseCount = 0;
+                    }
+                }
+                // Pulse goes low
+                SET_IR_PULSE(false);
+            }
+            else
+            {
+                // Sense should happen about 30 us after false->true transition if hand is there
+                gHandSensed = false;
+                // Pulse goes high
+                SET_IR_PULSE(true);
+            }
+
+        }
+        else
+        {
+            // Just go back to waiting
+            SET_PUMP(false);
+            SET_WHITE_LED(false);
+            outputIrStop();
+            nextMode(TIMER_MODE_IR_WAIT);
+        }
+        break;
+    case 3:
+        SET_PUMP(false);
+        SET_WHITE_LED(false);
+        // Wait indefinitely until hand is removed
+        if (isHandRemoved())
+        {
+            // Turn pump back on
+            SET_PUMP(true);
+            SET_WHITE_LED(true);
+            // Get ready to wait for hand released
+            SET_IR_ACTIVE(true);
+            SET_IR_PULSE(false);
+            gHandSensed = false;
+            gSenseCount = 0;
+            P1IE |= P1_IPIN_IR_SENSE;
+            // Go to next state
+            gDispenseTime = 0;
+            ++gPrankState;
+        }
+        break;
+    case 4:
+        if (gDispenseTime >= gPrankDispenseCounts[3] && isHandRemoved())
+        {
+            // We are done here
+            ++gPrankState;
+            SET_PUMP(false);
+            SET_WHITE_LED(false);
+            outputIrStop();
+            nextMode(TIMER_MODE_IR_WAIT);
+        }
+        break;
+    default:
+        ALL_OUTPUTS_OFF();
+        nextMode(TIMER_MODE_IR_WAIT);
+        break;
+    }
+}
+
+inline void timerModeDispense()
+{
     // Is the hand now removed from the sensor?
-    if (gSenseCount >= IR_DEACTIVATION_THRESHOLD)
+    if (isHandRemoved())
     {
         // We are done dispensing
         ALL_OUTPUTS_OFF();
@@ -385,14 +503,16 @@ inline void timerModeDispense()
         // Force battery check on IR wait entry
         gBattWaitCount = CHECK_BATT_COUNT;
     }
-    // Have we reached the maximum 1.8s threshold?
-    else if (gDispenseTime >= gMaxDispenseCount)
+    else if (gDispenseTime < gMaxDispenseCount)
+    {
+        ++gDispenseTime;
+    }
+    // Otherwise, we reached the maximum 1.8s threshold?
+    else
     {
         // Turn off the pump, but we aren't done "dispensing" until hand is removed.
         SET_PUMP(false);
         SET_WHITE_LED(false);
-        // Just to make sure this counter is now pegged for next loop
-        gDispenseTime = gMaxDispenseCount - 1;
         // Blink red LED if hand continues to be sensed for an extended period of time
         if (gSensorUnblockCount >= gImWaitingCounts[gImWaitingState])
         {
@@ -423,6 +543,9 @@ __interrupt void Timer_A0(void)
         break;
     case TIMER_MODE_DISPENSE:
         timerModeDispense();
+        break;
+    case TIMER_MODE_PRANK_DISPENSE:
+        timerModePrankDispense();
         break;
     case TIMER_MODE_ENTER_RUN:
         // Enter run mode
@@ -459,34 +582,42 @@ __interrupt void Port_1(void)
       // Note: debounce is not needed because that is handled by capacitive button sensor chip
 
       P1IFG &= ~P1_IPIN_BUTTON; // Clear interrupt flag
-      if (gPowerState)
+      // Don't allow power control while on and running the prank
+      if (!gPowerState || !gPrankModeEnabled || gPrankState >= PRANK_STATE_COUNT)
       {
-          // Go from on to off
-          if (gTimerMode != TIMER_MODE_ENTER_RUN)
+          if (gPowerState)
           {
-              gPowerOnCount = 0;
+              // Go from on to off
+              if (gTimerMode != TIMER_MODE_ENTER_RUN)
+              {
+                  gPowerOnCount = 0;
+              }
+              gPrankModeEnabled = false;
+              ALL_OUTPUTS_OFF();
+              SET_RED_LED(true);
+              nextMode(TIMER_MODE_EXIT_RUN);
           }
-          gPrankModeEnabled = false;
-          ALL_OUTPUTS_OFF();
-          SET_RED_LED(true);
-          nextMode(TIMER_MODE_EXIT_RUN);
-      }
-      else
-      {
-          // Go from off to on
-          if (gTimerMode == TIMER_MODE_EXIT_RUN)
+          else
           {
-              gPowerOnCount++;
-              gPrankModeEnabled = (gPowerOnCount == PRANK_MODE_POWER_ON_COUNT);
+              // Go from off to on
+              if (gTimerMode == TIMER_MODE_EXIT_RUN)
+              {
+                  ++gPowerOnCount;
+                  gPrankModeEnabled = (gPowerOnCount == PRANK_MODE_POWER_ON_COUNT);
+              }
+              else
+              {
+                  gPowerOnCount = 1;
+              }
+              ALL_OUTPUTS_OFF();
+              SET_WHITE_LED(true);
+              calibrate(); // Calibrate timer
+              nextMode(TIMER_MODE_ENTER_RUN);
+              ENABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM4 to LPM3
           }
-          ALL_OUTPUTS_OFF();
-          SET_WHITE_LED(true);
-          calibrate(); // Calibrate timer
-          nextMode(TIMER_MODE_ENTER_RUN);
-          ENABLE_OSCILLATOR_ON_EXIT(); // Essentially moving from LPM4 to LPM3
+          // Toggle to new state
+          gPowerState = !gPowerState;
       }
-      // Toggle to new state
-      gPowerState = !gPowerState;
   }
   else if (P1IFG & P1_IPIN_IR_SENSE)
   {
