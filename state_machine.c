@@ -135,6 +135,7 @@ inline bool executeState(void)
         CCTL0 = 0;
         ALL_OUTPUTS_OFF();
         SET_RED_LED(false);
+        gTimerMode = TIMER_MODE_NONE;
         rv = true; // Tell caller to enter LPM4
         break;
     }
