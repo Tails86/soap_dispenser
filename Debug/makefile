@@ -10,7 +10,12 @@ GEN_OPTS__FLAG :=
 GEN_CMDS__FLAG := 
 
 ORDERED_OBJS += \
+"./VLO_Library.obj" \
+"./button.obj" \
+"./interrupts.obj" \
 "./main.obj" \
+"./sense.obj" \
+"./state_machine.obj" \
 "../lnk_msp430g2452.cmd" \
 $(GEN_CMDS__FLAG) \
 -llibc.a \
@@ -140,7 +145,7 @@ all: $(OBJS) $(CMD_SRCS) $(GEN_CMDS)
 Soap\ Dispenser.out: $(OBJS) $(CMD_SRCS) $(GEN_CMDS)
 	@echo 'Building target: "$@"'
 	@echo 'Invoking: MSP430 Linker'
-	"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/bin/cl430" -vmsp --use_hw_mpy=none --advice:power=all --define=__MSP430G2452__ -g --printf_support=minimal --diag_warning=225 --diag_wrap=off --display_error_number -z -m"Soap Dispenser.map" --heap_size=80 --stack_size=80 -i"D:/ti/ccs1011/ccs/ccs_base/msp430/include" -i"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/lib" -i"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/include" --reread_libs --diag_wrap=off --display_error_number --warn_sections --xml_link_info="Soap Dispenser_linkInfo.xml" --use_hw_mpy=none --rom_model -o "Soap Dispenser.out" $(ORDERED_OBJS)
+	"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/bin/cl430" -vmsp -O4 --opt_for_speed=5 --use_hw_mpy=none --advice:power=all --define=__MSP430G2452__ -g --printf_support=minimal --diag_warning=225 --diag_wrap=off --display_error_number -z -m"Soap Dispenser.map" --heap_size=80 --stack_size=80 -i"D:/ti/ccs1011/ccs/ccs_base/msp430/include" -i"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/lib" -i"D:/ti/ccs1011/ccs/tools/compiler/ti-cgt-msp430_20.2.1.LTS/include" --reread_libs --diag_wrap=off --display_error_number --warn_sections --xml_link_info="Soap Dispenser_linkInfo.xml" --use_hw_mpy=none --rom_model -o "Soap Dispenser.out" $(ORDERED_OBJS)
 	@echo 'Finished building target: "$@"'
 	@echo ' '
 
@@ -154,8 +159,9 @@ Soap\ Dispenser.hex: $(EXE_OUTPUTS)
 # Other Targets
 clean:
 	-$(RM) $(BIN_OUTPUTS__QUOTED)$(EXE_OUTPUTS__QUOTED)
-	-$(RM) "main.obj" 
-	-$(RM) "main.d" 
+	-$(RM) "VLO_Library.obj" "button.obj" "interrupts.obj" "main.obj" "sense.obj" "state_machine.obj" 
+	-$(RM) "button.d" "interrupts.d" "main.d" "sense.d" "state_machine.d" 
+	-$(RM) "VLO_Library.d" 
 	-@echo 'Finished clean'
 	-@echo ' '
 
